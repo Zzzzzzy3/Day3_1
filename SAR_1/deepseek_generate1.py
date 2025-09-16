@@ -29,14 +29,19 @@ class SARDetectionDataset(Dataset):
         self.transform = transform
 
         # 获取图像文件列表
-        self.image_files = []
-        valid_extensions = ('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp')
+        # self.image_files = []
+        # valid_extensions = ('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp')
+        # for f in os.listdir(image_dir):
+        #     if f.lower().endswith(valid_extensions):
+        #         ann_file = os.path.splitext(f)[0] + '.txt'
+        #         ann_path = os.path.join(ann_dir, ann_file)
+        #         if os.path.exists(ann_path):
+        #             self.image_files.append(f)
+        self.image_files=[]
+        valid_extensions = '.png'
         for f in os.listdir(image_dir):
             if f.lower().endswith(valid_extensions):
-                ann_file = os.path.splitext(f)[0] + '.txt'
-                ann_path = os.path.join(ann_dir, ann_file)
-                if os.path.exists(ann_path):
-                    self.image_files.append(f)
+                self.image_files.append(f)
 
         # 限制样本数量以避免内存问题
         if max_samples and len(self.image_files) > max_samples:
@@ -199,7 +204,7 @@ def collate_fn(batch):
     return images, targets
 
 
-# 5. 简化的mAP计算
+# 5. 简化的mAP计算(检测时没有考虑分类
 def calculate_simple_map(detections, ground_truths, iou_threshold=0.5):
     """简化的mAP计算，避免复杂逻辑"""
     try:
@@ -366,7 +371,7 @@ def main():
             collate_fn=collate_fn,
             num_workers=0
         )
-
+        exit()
         # 创建模型
         print("Creating model...")
         model = create_model(num_classes=7)
