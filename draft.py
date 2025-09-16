@@ -1,14 +1,9 @@
 import torch
+import os
+image_dir = r'D:\user_3188\AIC_SAR\source\train\images'
+ann_dir = r'D:\user_3188\AIC_SAR\source\train\annfiles'
+valid_extensions = ('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp')
 
-# 检查是否有可用的GPU
-if torch.cuda.is_available():
-    # 获取GPU数量
-    gpu_count = torch.cuda.device_count()
-    print(f"Number of available GPUs: {gpu_count}")
-
-    # 获取当前使用的GPU索引
-    current_device = torch.cuda.current_device()
-    print(f"Currently using GPU {current_device}: {torch.cuda.get_device_name(current_device)}")
-else:
-    print("CUDA is not available. Using CPU.")
-
+line="163.0 144.0 175.0 138.0 190.0 167.0 178.0 173.0 ship 0"
+parts = line.split()
+print(parts)

@@ -12,6 +12,8 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import warnings
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 
 warnings.filterwarnings('ignore')
 
@@ -20,8 +22,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'Using device: {device}')
 
 
-# 1. 修复的数据集类
-#把“图像文件夹 + 标签文件夹”里能对的上的文件全部扫出来，做成列表。
+# 修复的数据集类
 class SARDetectionDataset(Dataset):
     def __init__(self, image_dir, ann_dir, transform=None, max_samples=2000):
         self.image_dir = image_dir
@@ -81,11 +82,27 @@ class SARDetectionDataset(Dataset):
                     x_min, y_min = min(xs), min(ys)
                     x_max, y_max = max(xs), max(ys)
 
-                    # 过滤无效框
-                    if (x_max - x_min >= 2 and y_max - y_min >= 2 and
-                            x_min >= 0 and y_min >= 0 and x_max <= 256 and y_max <= 256):
-                        boxes.append([x_min, y_min, x_max, y_max])
-                        labels.append(self.class_dict.get(class_name, 0))
+                    # 确保坐标在合理范围内
+                    x_min = max(0, min(x_min, 255))
+                    y_min = max(0, min(y_min, 255))
+                    x_max = max(0, min(x_max, 255))
+                    y_max = max(0, min(y_max, 255))
+
+                    # 确保宽度和高度至少为2像素
+                    if x_max - x_min < 2:
+                        x_max = x_min + 2
+                    if y_max - y_min < 2:
+                        y_max = y_min + 2
+
+                    # 确保不超过图像边界
+                    if x_max > 255:
+                        x_max = 255
+                    if y_max > 255:
+                        y_max = 255
+
+                    # 归一化到 [0, 1] 范围
+                    boxes.append([x_min / 256, y_min / 256, x_max / 256, y_max / 256])
+                    labels.append(self.class_dict.get(class_name, 0))
 
                 except (ValueError, IndexError):
                     continue
@@ -110,9 +127,28 @@ class SARDetectionDataset(Dataset):
             # 解析标注
             boxes, labels = self.parse_annotation(ann_path)
 
-            # 如果没有标注，创建空标注
+            # 过滤无效的边界框（宽度或高度为0）
+            valid_boxes = []
+            valid_labels = []
+            for box, label in zip(boxes, labels):
+                x_min, y_min, x_max, y_max = box
+                # 确保边界框有正宽度和高度
+                if x_max - x_min > 0.001 and y_max - y_min > 0.001:  # 至少0.1%的宽度/高度
+                    # 确保坐标在[0,1]范围内
+                    box = [
+                        max(0, min(1, x_min)),
+                        max(0, min(1, y_min)),
+                        max(0, min(1, x_max)),
+                        max(0, min(1, y_max))
+                    ]
+                    valid_boxes.append(box)
+                    valid_labels.append(label)
+
+            boxes, labels = valid_boxes, valid_labels
+
+            # 如果没有有效标注，创建空标注
             if len(boxes) == 0:
-                boxes = [[0, 0, 1, 1]]  # 添加一个虚拟框避免错误
+                boxes = [[0.1, 0.1, 0.2, 0.2]]  # 添加一个小的虚拟框
                 labels = [0]
 
             # 应用变换
@@ -126,6 +162,18 @@ class SARDetectionDataset(Dataset):
                     image = transformed['image']
                     boxes = transformed['bboxes']
                     labels = transformed['class_labels']
+
+                    # 再次过滤变换后可能无效的边界框
+                    valid_boxes = []
+                    valid_labels = []
+                    for box, label in zip(boxes, labels):
+                        x_min, y_min, x_max, y_max = box
+                        if x_max - x_min > 0.001 and y_max - y_min > 0.001:
+                            valid_boxes.append(box)
+                            valid_labels.append(label)
+
+                    boxes, labels = valid_boxes, valid_labels
+
                 except Exception as e:
                     print(f"Transform error: {e}")
                     # 使用原始数据
@@ -159,11 +207,8 @@ class SARDetectionDataset(Dataset):
             return empty_image, empty_target
 
 
-# 2. 简化的数据增强
+# 简化的数据增强
 def get_simple_transform(train=True):
-    import albumentations as A
-    from albumentations.pytorch import ToTensorV2
-
     if train:
         return A.Compose([
             A.HorizontalFlip(p=0.3),
@@ -179,7 +224,7 @@ def get_simple_transform(train=True):
         ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['class_labels']))
 
 
-# 3. 创建模型
+# 创建模型
 def create_model(num_classes=7):
     model = fasterrcnn_resnet50_fpn(pretrained=True)
     in_features = model.roi_heads.box_predictor.cls_score.in_features
@@ -187,19 +232,59 @@ def create_model(num_classes=7):
     return model
 
 
-# 4. 自定义collate函数 - 修复版本
+# 自定义collate函数
 def collate_fn(batch):
     images = []
     targets = []
 
     for image, target in batch:
+        # 确保图像是tensor
+        if not isinstance(image, torch.Tensor):
+            image = torch.from_numpy(image).permute(2, 0, 1).float()
         images.append(image)
         targets.append(target)
 
     return images, targets
 
 
-# 5. 简化的mAP计算
+# 过滤无效边界框的函数
+def filter_invalid_boxes(targets):
+    """过滤掉宽度或高度为0的边界框"""
+    filtered_targets = []
+    for target in targets:
+        boxes = target['boxes']
+        labels = target['labels']
+
+        # 计算宽度和高度
+        widths = boxes[:, 2] - boxes[:, 0]
+        heights = boxes[:, 3] - boxes[:, 1]
+
+        # 找到有效的边界框索引
+        valid_indices = (widths > 0) & (heights > 0)
+
+        if valid_indices.any():
+            filtered_target = {
+                'boxes': boxes[valid_indices],
+                'labels': labels[valid_indices],
+                'image_id': target['image_id'],
+                'area': target['area'][valid_indices] if 'area' in target else None,
+                'iscrowd': target['iscrowd'][valid_indices] if 'iscrowd' in target else None
+            }
+            filtered_targets.append(filtered_target)
+        else:
+            # 如果没有有效边界框，创建一个空的
+            filtered_targets.append({
+                'boxes': torch.zeros((0, 4), dtype=torch.float32),
+                'labels': torch.zeros(0, dtype=torch.int64),
+                'image_id': target['image_id'],
+                'area': torch.zeros(0),
+                'iscrowd': torch.zeros(0, dtype=torch.int64)
+            })
+
+    return filtered_targets
+
+
+# 简化的mAP计算
 def calculate_simple_map(detections, ground_truths, iou_threshold=0.5):
     """简化的mAP计算，避免复杂逻辑"""
     try:
@@ -227,7 +312,7 @@ def calculate_simple_map(detections, ground_truths, iou_threshold=0.5):
         return 0.0
 
 
-# 6. 稳定的训练函数
+# 稳定的训练函数
 def train_stable_model(model, train_loader, val_loader, num_epochs=15, lr=0.001):
     model.to(device)
 
@@ -247,13 +332,19 @@ def train_stable_model(model, train_loader, val_loader, num_epochs=15, lr=0.001)
         try:
             for batch_idx, (images, targets) in enumerate(train_loader):
                 try:
+                    # 过滤无效边界框
+                    targets = filter_invalid_boxes(targets)
+
                     # 过滤空目标
                     valid_indices = [i for i, t in enumerate(targets) if len(t['boxes']) > 0]
                     if not valid_indices:
                         continue
 
-                    images = [images[i].to(device) for i in valid_indices]
+                    images = [img.to(device) for i, img in enumerate(images) if i in valid_indices]
                     targets = [{k: v.to(device) for k, v in targets[i].items()} for i in valid_indices]
+
+                    # 确保图像是float类型并归一化
+                    images = [img.float() / 255.0 if img.max() > 1 else img.float() for img in images]
 
                     optimizer.zero_grad()
                     loss_dict = model(images, targets)
@@ -288,7 +379,6 @@ def train_stable_model(model, train_loader, val_loader, num_epochs=15, lr=0.001)
 
                 if val_map > best_map:
                     best_map = val_map
-                    # torch.save(model.state_dict(), 'best_model.pth')
                     print(f'New best mAP: {best_map:.4f}')
 
         except Exception as e:
@@ -298,7 +388,7 @@ def train_stable_model(model, train_loader, val_loader, num_epochs=15, lr=0.001)
     return model, train_losses
 
 
-# 7. 简化的评估函数
+# 简化的评估函数
 def evaluate_simple(model, data_loader):
     model.eval()
     detections = []
@@ -307,7 +397,10 @@ def evaluate_simple(model, data_loader):
     with torch.no_grad():
         for images, targets in data_loader:
             try:
-                images = [img.to(device) for img in images]
+                # 过滤无效边界框
+                targets = filter_invalid_boxes(targets)
+
+                images = [img.to(device).float() / 255.0 for img in images]
                 outputs = model(images)
 
                 for i, output in enumerate(outputs):
@@ -328,7 +421,7 @@ def evaluate_simple(model, data_loader):
     return calculate_simple_map(detections, ground_truths)
 
 
-# 8. 主函数
+# 主函数
 def main():
     try:
         # 数据路径
@@ -337,7 +430,7 @@ def main():
 
         print("Loading datasets...")
         # 创建数据集
-        dataset = SARDetectionDataset(image_dir, ann_dir, get_simple_transform(train=True), max_samples=2000)
+        dataset = SARDetectionDataset(image_dir, ann_dir, get_simple_transform(train=True), max_samples=1000)
 
         # 分割训练验证集
         train_size = int(0.8 * len(dataset))
@@ -348,15 +441,13 @@ def main():
 
         print(f'Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}')
 
-        import matplotlib.patches as patches
-
-        # 数据加载器 - 使用更少的worker避免错误
+        # 数据加载器
         train_loader = DataLoader(
             train_dataset,
             batch_size=4,
             shuffle=True,
             collate_fn=collate_fn,
-            num_workers=0,  # 设置为0避免多进程错误
+            num_workers=0,
             pin_memory=True
         )
         val_loader = DataLoader(
@@ -366,6 +457,32 @@ def main():
             collate_fn=collate_fn,
             num_workers=0
         )
+        dataset = SARDetectionDataset(image_dir, ann_dir, get_simple_transform(train=True), max_samples=10)
+
+        for i in range(5):
+            img, target = dataset[i]
+            print(f"Sample {i}: boxes={target['boxes']}, labels={target['labels']}")
+
+        import matplotlib.patches as patches
+
+        def visualize_sample(dataset, idx):
+            img, target = dataset[idx]
+            img = img.permute(1, 2, 0).numpy()  # Convert to HWC for visualization
+            fig, ax = plt.subplots(1)
+            ax.imshow(img)
+            for box in target['boxes']:
+                x_min, y_min, x_max, y_max = box
+                # Denormalize for visualization
+                x_min, y_min, x_max, y_max = x_min * 256, y_min * 256, x_max * 256, y_max * 256
+                rect = patches.Rectangle((x_min, y_min), x_max - x_min, y_max - y_min, linewidth=2, edgecolor='r',
+                                         facecolor='none')
+                ax.add_patch(rect)
+            plt.show()
+
+        for i in range(5):
+            visualize_sample(dataset, i)
+        exit()
+
 
         # 创建模型
         print("Creating model...")
@@ -377,8 +494,6 @@ def main():
             model, train_loader, val_loader, num_epochs=15, lr=0.001
         )
 
-        # 保存最终模型
-        # torch.save(trained_model.state_dict(), 'final_model.pth')
         print("Training completed successfully!")
 
         # 绘制训练曲线
