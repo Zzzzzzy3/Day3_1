@@ -192,7 +192,7 @@ if __name__ == '__main__':
     image_folder ="D:/user_3188/AIC_SAR/source/train/images"
 
     try:
-        file_index = int(input("请输入要处理的文件序号(从1开始): ").strip())
+        file_index = int(input("请输入要处理的文件序号(从0开始): ").strip())+1
     except ValueError:
         print("错误: 请输入有效的数字")
         exit(1)
