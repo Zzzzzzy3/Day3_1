@@ -1,1 +1,6 @@
 *.pth
+*.png
+*.txt
+*.cache
+*.pt
+*.yaml
